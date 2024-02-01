@@ -13,11 +13,14 @@
 
 (require 'smudge-api)
 (require 'smudge-controller)
+(require 'smudge-image)
 
 (defvar smudge-current-page)
 (defvar smudge-query)
 (defvar smudge-selected-album)
 (defvar smudge-recently-played)
+(defvar smudge-artwork-fetch-target-count 0)
+(defvar smudge-artwork-fetch-count 0)
 
 (defvar smudge-track-search-mode-map
   (let ((map (make-sparse-keymap)))
@@ -43,10 +46,10 @@ If the cursor is on a button representing an artist or album, start playing that
   (interactive)
   (let ((button-type (smudge-track-selected-button-type)))
     (cond ((eq 'artist button-type)
-	   (smudge-track-artist-select))
-	  ((eq 'album button-type)
-	   (smudge-track-album-select))
-	  (t (smudge-track-select-default)))))
+	       (smudge-track-artist-select))
+	      ((eq 'album button-type)
+	       (smudge-track-album-select))
+	      (t (smudge-track-select-default)))))
 
 (defun smudge-track-select-default ()
   "Play the track under the cursor.
@@ -166,17 +169,26 @@ without a context."
   "Fetch PAGE of of tracks for ALBUM."
   (let ((buffer (current-buffer)))
     (smudge-api-album-tracks
-     album
-     page
-     (lambda (json)
-       (if-let ((items (smudge-api-get-items json)))
+	 album
+	 page
+	 (lambda (json)
+	   (if-let ((items (smudge-api-get-items json)))
            (with-current-buffer buffer
              (setq-local smudge-current-page page)
              (setq-local smudge-selected-album album)
-             (pop-to-buffer buffer)
-             (smudge-track-search-print items page)
-             (message "Track view updated"))
-         (message "No more tracks"))))))
+			 ;; jam the album data into every song so we can extract
+			 ;; the artwork
+			 (smudge-api-album (gethash 'id album)
+							   (lambda (album-json)
+								 (message "album json: %s" album-json)
+								 (pop-to-buffer buffer)
+								 (let ((items-with-image-url
+										(mapc (lambda (item)
+												(puthash 'album album-json item))
+											  items)))
+								   (smudge-track-search-print items page)
+								   (message "Track view updated")))))
+		 (message "No more tracks"))))))
 
 (defun smudge-track-recently-played-tracks-update (page)
   "Fetch PAGE of results for the recently played tracks."
@@ -195,25 +207,27 @@ without a context."
 
 (defun smudge-track-search-set-list-format ()
   "Configure the column data for the typical track view.
-Default to sortin tracks by number when listing the tracks from an album."
+Default to sorting tracks by number when listing the tracks from an album."
   (let* ((base-width (truncate (/ (- (window-width) 30) 3)))
-         (default-width (if (bound-and-true-p smudge-selected-album) (+ base-width 4) base-width )))
-    (unless (bound-and-true-p smudge-selected-playlist)
-      (setq tabulated-list-sort-key `("#" . nil)))
-    (setq tabulated-list-format
-          (vconcat (vector `("#" 3 ,(lambda (row-1 row-2)
-                                      (< (+ (* 100 (smudge-api-get-disc-number (car row-1)))
-                                            (smudge-api-get-track-number (car row-1)))
-                                         (+ (* 100 (smudge-api-get-disc-number (car row-2)))
-                                            (smudge-api-get-track-number (car row-2))))) :right-align t)
-                           `("Track Name" ,default-width t)
-                           `("Artist" ,default-width t)
-                           `("Album" ,default-width t)
-                           `("Time" 8 (lambda (row-1 row-2)
-                                        (< (smudge-get-track-duration (car row-1))
-                                           (smudge-get-track-duration (car row-2))))))
-                   (unless (bound-and-true-p smudge-selected-album)
-                     (vector '("Popularity" 14 t)))))))
+		 (default-width (if (bound-and-true-p smudge-selected-album) (+ base-width 4) base-width )))
+	(unless (bound-and-true-p smudge-selected-playlist)
+	  (setq tabulated-list-sort-key `("#" . nil)))
+	(setq tabulated-list-format
+		  (vconcat (vector
+					`("" -1) ;; image url column - do not display
+					`("#" 3 ,(lambda (row-1 row-2)
+							   (< (+ (* 100 (smudge-api-get-disc-number (car row-1)))
+									 (smudge-api-get-track-number (car row-1)))
+								  (+ (* 100 (smudge-api-get-disc-number (car row-2)))
+                                     (smudge-api-get-track-number (car row-2))))) :right-align t)
+                    `("Track Name" ,default-width t)
+                    `("Artist" ,default-width t)
+                    `("Album" ,default-width t)
+					`("Time" 8 (lambda (row-1 row-2)
+								 (< (smudge-api-get-track-duration (car row-1))
+									(smudge-api-get-track-duration (car row-2))))))
+				   (unless (bound-and-true-p smudge-selected-album)
+					 (vector '("Popularity" 14 t)))))))
 
 (defun smudge-track-search-print (songs page)
   "Append SONGS to the PAGE of track view."
@@ -225,26 +239,44 @@ Default to sortin tracks by number when listing the tracks from an album."
                (album-name (smudge-api-get-item-name album))
                (album (smudge-api-get-track-album song)))
           (push (list song
-                      (vector (number-to-string (smudge-api-get-track-number song))
-                              (smudge-api-get-item-name song)
-                              (cons artist-name
-                                    (list 'face 'link
-                                          'follow-link t
-                                          'action `(lambda (_) (smudge-track-search ,(format "artist:\"%s\"" artist-name)))
-                                          'help-echo (format "Show %s's tracks" artist-name)
-					  'artist-or-album 'artist))
-                              (cons album-name
-                                    (list 'face 'link
-                                          'follow-link t
-                                          'action `(lambda (_) (smudge-track-album-tracks ,album))
-                                          'help-echo (format "Show %s's tracks" album-name)
-					  'artist-or-album 'album))
-                              (smudge-api-get-track-duration-formatted song)
-                              (unless (bound-and-true-p smudge-selected-album)
-                                (smudge-api-popularity-bar (smudge-api-get-track-popularity song)))))
+                      (vector
+                       (if smudge-show-artwork (smudge-api-get-song-art-url song) "")
+                       (number-to-string (smudge-api-get-track-number song))
+                       (smudge-api-get-item-name song)
+                       (cons artist-name
+                             (list 'face 'link
+                                   'follow-link t
+                                   'action `(lambda (_) (smudge-track-search ,(format "artist:\"%s\"" artist-name)))
+                                   'help-echo (format "Show %s's tracks" artist-name)
+			                       'artist-or-album 'artist))
+                       (cons album-name
+                             (list 'face 'link
+                                   'follow-link t
+                                   'action `(lambda (_) (smudge-track-album-tracks ,album))
+                                   'help-echo (format "Show %s's tracks" album-name)
+			                       'artist-or-album 'album))
+                       (smudge-api-get-track-duration-formatted song)
+                       (unless (bound-and-true-p smudge-selected-album)
+                         (smudge-api-popularity-bar (smudge-api-get-track-popularity song)))))
                 entries))))
+
+    (setq tabulated-list-printer #'tabulated-list-print-entry)
+    (when smudge-show-artwork
+      (setq tabulated-list-printer #'smudge-image-tabulated-list-print-entry)
+      (setq smudge-artwork-fetch-target-count
+		    (+ (length songs) (if (eq 1 page) 0 (count-lines (point-min) (point-max)))))
+      (setq smudge-artwork-fetch-count 0)
+      (setq line-spacing 10)
+      (message "Fetching tracks...")
+      ;; in case the fetch chokes somehow, don't lock up all of emacs forever
+      (run-at-time "3 sec" nil (lambda () (setq inhibit-redisplay nil)))
+      ;; Undocumented function. Could be dangerous if there's a bug
+      (setq inhibit-redisplay t)
+      (setq left-margin-width 6)
+      (set-window-buffer (selected-window) (current-buffer)))
     (smudge-track-search-set-list-format)
     (when (eq 1 page) (setq-local tabulated-list-entries nil))
+    (smudge-track-search-set-list-format)
     (setq-local tabulated-list-entries (append tabulated-list-entries (nreverse entries)))
     (tabulated-list-init-header)
     (tabulated-list-print t)))
@@ -306,28 +338,28 @@ Default to sortin tracks by number when listing the tracks from an album."
   ;; Check whether the mark is active and if so, queue all the tracks in the
   ;; region. If not, queue the track under the cursor.
   (if (null mark-active)
-   (let ((selected-track (tabulated-list-get-id)))
-     (setq track-id (smudge-api-get-item-uri selected-track))
-     (smudge-api-queue-add-track
-       track-id
-       (lambda(_)
-         (message "Added \"%s\" to your queue." (smudge-api-get-item-name selected-track)))))
-   (let((start (region-beginning))
+      (let ((selected-track (tabulated-list-get-id)))
+        (setq track-id (smudge-api-get-item-uri selected-track))
+        (smudge-api-queue-add-track
+         track-id
+         (lambda(_)
+           (message "Added \"%s\" to your queue." (smudge-api-get-item-name selected-track)))))
+    (let((start (region-beginning))
          (end (region-end))
          (tracks '()))
-     (save-excursion
-       (goto-char start)
-       (while (< (point) end)
-         (setq selected-track (tabulated-list-get-id))
-         (setq track-id (smudge-api-get-item-uri selected-track))
-         (setq tracks (cons track-id tracks))
-         (forward-line 1)))
-     (smudge-api-queue-add-tracks
+      (save-excursion
+        (goto-char start)
+        (while (< (point) end)
+          (setq selected-track (tabulated-list-get-id))
+          (setq track-id (smudge-api-get-item-uri selected-track))
+          (setq tracks (cons track-id tracks))
+          (forward-line 1)))
+      (smudge-api-queue-add-tracks
        (reverse tracks)
        nil)
-     ;; Send the message here instead of in the callback
-     ;; because the API call has to sequentially add each song which might take some time.
-     (message "Added %d tracks to your queue." (length tracks)))))
+      ;; Send the message here instead of in the callback
+      ;; because the API call has to sequentially add each song which might take some time.
+      (message "Added %d tracks to your queue." (length tracks)))))
 
 
 (provide 'smudge-track)
